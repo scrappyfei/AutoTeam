@@ -1259,8 +1259,17 @@ class TaskParams(BaseModel):
     target: int = 5
 
 
+class FillParams(BaseModel):
+    target: int = 5
+    prioritize_new: bool = False
+
+
 class CleanupParams(BaseModel):
     max_seats: int | None = None
+
+
+class AddParams(BaseModel):
+    count: int = 1
 
 
 class AdminEmailParams(BaseModel):
@@ -2640,24 +2649,30 @@ def post_rotate(params: TaskParams = TaskParams()):
 
 
 @app.post("/api/tasks/add", status_code=202)
-def post_add():
+def post_add(params: AddParams = AddParams()):
     """添加新账号（后台执行）"""
     _require_pool_operation_configs("添加新账号")
 
     from autoteam.manager import cmd_add
 
-    task = _start_task("add", cmd_add, {})
+    task = _start_task("add", cmd_add, {"count": params.count}, params.count)
     return task
 
 
 @app.post("/api/tasks/fill", status_code=202)
-def post_fill(params: TaskParams = TaskParams()):
+def post_fill(params: FillParams = FillParams()):
     """补满 Team 成员（后台执行）"""
     _require_pool_operation_configs("补满 Team 成员")
 
     from autoteam.manager import cmd_fill
 
-    task = _start_task("fill", cmd_fill, {"target": params.target}, params.target)
+    task = _start_task(
+        "fill",
+        cmd_fill,
+        {"target": params.target, "prioritize_new": params.prioritize_new},
+        params.target,
+        params.prioritize_new,
+    )
     return task
 
 

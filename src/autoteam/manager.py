@@ -2849,22 +2849,80 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
-def cmd_add():
-    """手动添加一个新账号"""
+def cmd_add(count: int = 1):
+    """手动添加新账号，支持循环添加且每次先踢出最低额度 active 账号"""
     _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
     mail_client = CloudMailClient()
     mail_client.login()
 
+    success_count = 0
     try:
-        _abort_if_cancel_requested()
-        result = create_new_account(chatgpt, mail_client)  # 内部会 stop chatgpt
-        if result:
-            logger.info("[添加] 新账号添加成功: %s", result)
+        for i in range(count):
+            _abort_if_cancel_requested()
+            logger.info("[添加] 开始执行第 %d/%d 轮账号添加...", i + 1, count)
+
+            # 1. 查找 active 且额度最低的本地管理账号并剔除
+            active_accounts = [
+                a
+                for a in load_accounts()
+                if a["status"] == STATUS_ACTIVE
+                and not _is_main_account_email(a.get("email"))
+                and not is_account_disabled(a)
+            ]
+
+            if active_accounts:
+                # 按照剩余 5h 额度升序排序：primary_pct 越大，说明用得越多，剩余额度越小
+                active_accounts.sort(
+                    key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0)
+                )
+                evict_acc = active_accounts[0]
+                email_to_remove = evict_acc["email"]
+
+                logger.info(
+                    "[添加] [%d/%d] 发现额度最低的活跃账号: %s，准备移出以释放席位",
+                    i + 1,
+                    count,
+                    email_to_remove,
+                )
+
+                if not _chatgpt_session_ready(chatgpt):
+                    chatgpt.start()
+
+                remove_status = remove_from_team(chatgpt, email_to_remove, return_status=True)
+                if remove_status in ("removed", "already_absent"):
+                    update_account(email_to_remove, status=STATUS_STANDBY)
+                    logger.info(
+                        "[添加] [%d/%d] 账号移出成功: %s -> standby",
+                        i + 1,
+                        count,
+                        email_to_remove,
+                    )
+                else:
+                    logger.error(
+                        "[添加] [%d/%d] 移出账号 %s 失败，终止后续添加流程",
+                        i + 1,
+                        count,
+                        email_to_remove,
+                    )
+                    break
+            else:
+                logger.info("[添加] [%d/%d] 当前无活跃账号需移出，直接尝试添加新账号", i + 1, count)
+
+            # 2. 正常发起添加账号流程
+            result = create_new_account(chatgpt, mail_client)
+            if result:
+                success_count += 1
+                logger.info("[添加] [%d/%d] 新账号添加成功: %s", i + 1, count, result)
+            else:
+                logger.error("[添加] [%d/%d] 添加账号失败，终止后续添加流程", i + 1, count)
+                break
+
+        # 3. 统一同步一次 CPA 等远端状态
+        if success_count > 0:
+            logger.info("[添加] 成功添加 %d/%d 个账号，触发远端状态同步", success_count, count)
             sync_to_cpa()
-        else:
-            logger.error("[添加] 添加失败")
     finally:
         if _chatgpt_session_ready(chatgpt):
             chatgpt.stop()
@@ -3087,7 +3145,7 @@ def get_team_member_count(chatgpt_api):
     return len(members)
 
 
-def cmd_fill(target=5):
+def cmd_fill(target=5, prioritize_new=False):
     """检测 Team 成员数，不足 target 则自动添加新账号补满"""
     _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
@@ -3112,7 +3170,7 @@ def cmd_fill(target=5):
             logger.error("[填充] 获取成员列表失败")
             return
 
-        logger.info("[填充] 当前 Team 成员数: %d，目标: %d", current, target)
+        logger.info("[填充] 当前 Team 成员数: %d，目标: %d，模式: %s", current, target, "优先新建" if prioritize_new else "优先复用")
 
         need = target - current
         if need <= 0:
@@ -3131,37 +3189,68 @@ def cmd_fill(target=5):
             _abort_if_cancel_requested()
             logger.info("[填充] 添加第 %d/%d 个账号...", i + 1, need)
 
-            # 优先复用 standby 中额度已恢复的旧账号
             added = False
-            while standby_index < len(standby_list):
-                _abort_if_cancel_requested()
-                reusable = standby_list[standby_index]
-                standby_index += 1
-                email = reusable["email"]
-                skip_reason = _auto_reuse_skip_reason(reusable)
-                if skip_reason:
-                    logger.info("[填充] 跳过旧账号: %s（%s）", email, skip_reason)
-                    continue
-                retry_skip_reason = _auth_repair_skip_reason(reusable, force=False)
-                if retry_skip_reason:
-                    logger.info("[填充] 跳过旧账号: %s（%s）", email, retry_skip_reason)
-                    continue
-                logger.info("[填充] 复用旧账号: %s", email)
-                # 确保 chatgpt 浏览器可用
-                if not _chatgpt_session_ready(chatgpt):
-                    chatgpt.start()
-                added = reinvite_account(chatgpt, ensure_account_mail(reusable), reusable)
-                if added:
-                    break
-                logger.warning("[填充] 复用旧账号失败，尝试下一个旧账号: %s", email)
 
-            if not added:
-                _abort_if_cancel_requested()
-                # 创建新账号
-                logger.info("[填充] 创建新账号...")
+            if prioritize_new:
+                # 1. 优先创建新账号
+                logger.info("[填充] [优先模式] 尝试创建新账号...")
                 if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 added = create_new_account(chatgpt, mail_client)
+
+                # 2. 如果创建新账号失败，尝试复用 standby 旧账号
+                if not added:
+                    logger.info("[填充] 新建账号失败，尝试复用 standby 旧账号...")
+                    while standby_index < len(standby_list):
+                        _abort_if_cancel_requested()
+                        reusable = standby_list[standby_index]
+                        standby_index += 1
+                        email = reusable["email"]
+                        skip_reason = _auto_reuse_skip_reason(reusable)
+                        if skip_reason:
+                            logger.info("[填充] 跳过旧账号: %s（%s）", email, skip_reason)
+                            continue
+                        retry_skip_reason = _auth_repair_skip_reason(reusable, force=False)
+                        if retry_skip_reason:
+                            logger.info("[填充] 跳过旧账号: %s（%s）", email, retry_skip_reason)
+                            continue
+                        logger.info("[填充] 复用旧账号: %s", email)
+                        if not _chatgpt_session_ready(chatgpt):
+                            chatgpt.start()
+                        added = reinvite_account(chatgpt, ensure_account_mail(reusable), reusable)
+                        if added:
+                            break
+                        logger.warning("[填充] 复用旧账号失败，尝试下一个旧账号: %s", email)
+            else:
+                # 1. 优先复用 standby 旧账号
+                while standby_index < len(standby_list):
+                    _abort_if_cancel_requested()
+                    reusable = standby_list[standby_index]
+                    standby_index += 1
+                    email = reusable["email"]
+                    skip_reason = _auto_reuse_skip_reason(reusable)
+                    if skip_reason:
+                        logger.info("[填充] 跳过旧账号: %s（%s）", email, skip_reason)
+                        continue
+                    retry_skip_reason = _auth_repair_skip_reason(reusable, force=False)
+                    if retry_skip_reason:
+                        logger.info("[填充] 跳过旧账号: %s（%s）", email, retry_skip_reason)
+                        continue
+                    logger.info("[填充] 复用旧账号: %s", email)
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    added = reinvite_account(chatgpt, ensure_account_mail(reusable), reusable)
+                    if added:
+                        break
+                    logger.warning("[填充] 复用旧账号失败，尝试下一个旧账号: %s", email)
+
+                # 2. 如果复用旧账号失败/无可用旧账号，尝试新建账号
+                if not added:
+                    _abort_if_cancel_requested()
+                    logger.info("[填充] 创建新账号...")
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    added = create_new_account(chatgpt, mail_client)
 
             if not added:
                 logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)

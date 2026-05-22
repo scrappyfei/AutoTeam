@@ -21,6 +21,14 @@
       <label class="text-sm text-gray-400">{{ paramLabel }}:</label>
       <input v-model.number="paramValue" type="number" min="1" max="20"
         class="w-20 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
+      
+      <!-- 优先新建账号选项 -->
+      <div v-if="pendingAction && pendingAction.key === 'fill'" class="flex items-center gap-1.5 ml-1">
+        <input v-model="prioritizeNew" type="checkbox" id="prioritize-new"
+          class="w-4 h-4 rounded bg-gray-800 border-gray-700 text-blue-600 focus:ring-blue-500 focus:ring-offset-0 focus:ring-1" />
+        <label for="prioritize-new" class="text-sm text-gray-400 cursor-pointer select-none">优先新建账号</label>
+      </div>
+
       <button @click="confirmAction" :disabled="pendingAction && isDisabled(pendingAction)"
         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
         确认执行
@@ -59,7 +67,7 @@ const actions = [
   { key: 'rotate', group: 'pool', label: '智能轮转', method: 'startRotate', needParam: true, paramName: 'target', style: 'bg-blue-600 text-white border-blue-500' },
   { key: 'check', group: 'pool', label: '检查额度', method: 'startCheck', needParam: false, style: 'bg-emerald-600 text-white border-emerald-500' },
   { key: 'fill', group: 'pool', label: '补满成员', method: 'startFill', needParam: true, paramName: 'target', style: 'bg-violet-600 text-white border-violet-500' },
-  { key: 'add', group: 'pool', label: '添加账号', method: 'startAdd', needParam: false, style: 'bg-amber-600 text-white border-amber-500' },
+  { key: 'add', group: 'pool', label: '添加账号', method: 'startAdd', needParam: true, paramName: 'count', style: 'bg-amber-600 text-white border-amber-500' },
   { key: 'cleanup', group: 'pool', label: '清理成员', method: 'startCleanup', needParam: false, style: 'bg-rose-600 text-white border-rose-500' },
   { key: 'sync', group: 'sync', label: '同步远端', method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-cyan-600 text-white border-cyan-500' },
   { key: 'pull-cpa', group: 'sync', label: '拉取 CPA', method: 'postSyncFromCpa', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-emerald-600 text-white border-emerald-500' },
@@ -69,6 +77,7 @@ const actions = [
 const showParams = ref(false)
 const paramLabel = ref('')
 const paramValue = ref(5)
+const prioritizeNew = ref(false)
 const pendingAction = ref(null)
 const message = ref('')
 const messageClass = ref('')
@@ -101,8 +110,9 @@ async function execute(action) {
   message.value = ''
   if (action.needParam) {
     pendingAction.value = action
-    paramLabel.value = action.paramName === 'target' ? '目标成员数' : '最大席位'
-    paramValue.value = 5
+    paramLabel.value = action.paramName === 'target' ? '目标成员数' : action.paramName === 'count' ? '添加账号数量' : '最大席位'
+    paramValue.value = action.paramName === 'count' ? 1 : 5
+    prioritizeNew.value = false
     showParams.value = true
     return
   }
@@ -112,7 +122,11 @@ async function execute(action) {
 async function confirmAction() {
   showParams.value = false
   if (pendingAction.value) {
-    await doExecute(pendingAction.value, paramValue.value)
+    if (pendingAction.value.key === 'fill') {
+      await doExecute(pendingAction.value, { target: paramValue.value, prioritizeNew: prioritizeNew.value })
+    } else {
+      await doExecute(pendingAction.value, paramValue.value)
+    }
     pendingAction.value = null
   }
 }
@@ -125,7 +139,12 @@ async function doExecute(action, param) {
       messageClass.value = 'bg-green-500/10 text-green-400 border border-green-500/20'
       emit('refresh')
     } else {
-      const result = await api[action.method](param)
+      let result
+      if (action.key === 'fill') {
+        result = await api[action.method](param.target, param.prioritizeNew)
+      } else {
+        result = await api[action.method](param)
+      }
       message.value = `任务已提交: ${result.task_id}`
       messageClass.value = 'bg-blue-500/10 text-blue-400 border border-blue-500/20'
       emit('task-started')

@@ -213,3 +213,84 @@ def test_cmd_fill_can_be_cancelled_before_creating_new_account(monkeypatch):
 
     assert events == []
     assert chatgpt.stopped == 1
+
+
+def test_cmd_fill_prioritize_new_creates_new_first(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    count_values = iter([4, 5])
+    events = []
+
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [
+            {"email": "old-1@example.com", "_quota_recovered": True},
+        ],
+    )
+
+    def fake_reinvite(_chatgpt, _mail, acc):
+        events.append(("reinvite", acc["email"]))
+        return True
+
+    monkeypatch.setattr(manager, "reinvite_account", fake_reinvite)
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail: events.append(("create", None)) or True,
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
+    monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
+
+    # 调用 cmd_fill 并开启 prioritize_new=True
+    manager.cmd_fill(target=5, prioritize_new=True)
+
+    # 应该先调用 create，由于 create 成功且达到 target，直接结束，不触发 reinvite
+    assert events == [
+        ("create", None),
+        ("sync", None),
+        ("status", None),
+    ]
+
+
+def test_cmd_fill_prioritize_new_falls_back_to_standby_on_creation_failure(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    count_values = iter([4, 5])
+    events = []
+
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [
+            {"email": "old-1@example.com", "_quota_recovered": True},
+        ],
+    )
+
+    def fake_reinvite(_chatgpt, _mail, acc):
+        events.append(("reinvite", acc["email"]))
+        return True
+
+    monkeypatch.setattr(manager, "reinvite_account", fake_reinvite)
+    # create_new_account 返回 False，模拟创建账号失败
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail: events.append(("create", None)) or False,
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
+    monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
+
+    manager.cmd_fill(target=5, prioritize_new=True)
+
+    # 创建失败后，应该回退尝试复用 old-1@example.com
+    assert events == [
+        ("create", None),
+        ("reinvite", "old-1@example.com"),
+        ("sync", None),
+        ("status", None),
+    ]

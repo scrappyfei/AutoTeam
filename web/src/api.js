@@ -88,8 +88,8 @@ export const api = {
 
   startRotate: (target = 5) => request('POST', '/tasks/rotate', { target }),
   startCheck: () => request('POST', '/tasks/check'),
-  startAdd: () => request('POST', '/tasks/add'),
-  startFill: (target = 5) => request('POST', '/tasks/fill', { target }),
+  startAdd: (count = 1) => request('POST', '/tasks/add', { count }),
+  startFill: (target = 5, prioritizeNew = false) => request('POST', '/tasks/fill', { target, prioritize_new: prioritizeNew }),
   startCleanup: (maxSeats = null) => request('POST', '/tasks/cleanup', { max_seats: maxSeats }),
   startResetQuota: () => request('POST', '/tasks/reset-quota'),
 
