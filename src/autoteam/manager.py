@@ -2927,6 +2927,23 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
+# 用于并发注册时区分不同 Worker 日志的线程本地变量与过滤器
+_worker_log_local = threading.local()
+
+class WorkerLogFilter(logging.Filter):
+    def filter(self, record):
+        prefix = getattr(_worker_log_local, "worker_prefix", "")
+        if prefix:
+            if isinstance(record.msg, str) and not record.msg.startswith("[Worker"):
+                record.msg = f"{prefix} {record.msg}"
+        return True
+
+# 确保过滤器已注册到 root logger
+root_logger = logging.getLogger()
+if not any(isinstance(f, WorkerLogFilter) for f in root_logger.filters):
+    root_logger.addFilter(WorkerLogFilter())
+
+
 def cmd_add(count: int = 1, concurrency: int = 1):
     """手动添加新账号，支持循环/并发添加且每次先踢出最低额度 active 账号"""
     _abort_if_cancel_requested()
@@ -2989,6 +3006,7 @@ def cmd_add(count: int = 1, concurrency: int = 1):
 
     def worker(worker_idx):
         nonlocal success_count
+        _worker_log_local.worker_prefix = f"[Worker-{worker_idx}]"
 
         while True:
             _abort_if_cancel_requested()
