@@ -1071,6 +1071,10 @@ def login_codex_via_browser(
             if auth_code:
                 break
 
+            if "add-phone" in page.url.lower() or "add_phone" in page.url.lower():
+                logger.warning("[Codex] 检测到 URL 包含 add-phone，停止授权步骤")
+                break
+
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
             try:
@@ -1192,22 +1196,25 @@ def login_codex_via_browser(
                 continue
 
         # 等待 redirect callback 获取 auth code
-        for _ in range(30):
-            if auth_code:
-                break
-            # 也从当前 URL 尝试提取（CPA 可能接收了回调）
-            try:
-                cur = page.url
-                if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in cur:
-                    parsed = urllib.parse.urlparse(cur)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    auth_code = qs.get("code", [None])[0]
-                    if auth_code:
-                        logger.info("[Codex] 从 URL 捕获到 auth code!")
-                        break
-            except Exception:
-                pass
-            time.sleep(1)
+        if not auth_code and ("add-phone" in page.url.lower() or "add_phone" in page.url.lower()):
+            logger.warning("[Codex] 处于 add-phone 页面，跳过等待 auth code")
+        else:
+            for _ in range(30):
+                if auth_code:
+                    break
+                # 也从当前 URL 尝试提取（CPA 可能接收了回调）
+                try:
+                    cur = page.url
+                    if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in cur:
+                        parsed = urllib.parse.urlparse(cur)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        auth_code = qs.get("code", [None])[0]
+                        if auth_code:
+                            logger.info("[Codex] 从 URL 捕获到 auth code!")
+                            break
+                except Exception:
+                    pass
+                time.sleep(1)
 
         if not auth_code:
             _screenshot(page, "codex_05_no_callback.png")

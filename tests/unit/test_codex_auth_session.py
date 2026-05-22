@@ -203,6 +203,14 @@ def test_classify_oauth_failure_detects_choose_account_page():
     assert retryable is True
 
 
+def test_classify_oauth_failure_detects_add_phone():
+    error_type, detail, retryable = codex_auth._classify_oauth_failure("https://auth.openai.com/add-phone")
+
+    assert error_type == "add_phone"
+    assert detail == "需要手机号验证"
+    assert retryable is False
+
+
 def test_select_oauth_account_clicks_matching_email_and_continue():
     other = _FakeElement("other@example.com")
     target = _FakeElement("tmpe7b9cd4b@xxmail.idapro.tech")
