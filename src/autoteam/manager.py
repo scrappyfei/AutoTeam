@@ -2983,10 +2983,12 @@ def cmd_add(count: int = 1, concurrency: int = 1):
     # 2. 线程池并发注册
     import concurrent.futures
 
+    # 在主线程初始化并登录单例共享的 mail_client，避免并发登录导致 token 互相失效
+    shared_mail_client = CloudMailClient()
+    shared_mail_client.login()
+
     def worker(worker_idx):
         nonlocal success_count
-        w_mail_client = CloudMailClient()
-        w_mail_client.login()
 
         while True:
             _abort_if_cancel_requested()
@@ -2997,7 +2999,7 @@ def cmd_add(count: int = 1, concurrency: int = 1):
             logger.info("[添加] [Worker-%d] 开始尝试创建新账号...", worker_idx)
             result = None
             try:
-                result = create_new_account(None, w_mail_client)
+                result = create_new_account(None, shared_mail_client)
             except Exception as exc:
                 logger.error("[添加] [Worker-%d] 创建新账号出现异常: %s", worker_idx, exc)
 
