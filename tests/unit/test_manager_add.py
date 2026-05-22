@@ -114,9 +114,9 @@ def test_cmd_add_multi_with_eviction(monkeypatch):
     assert events == [
         ("remove", "acc2_lowest@example.com"),
         ("update", "acc2_lowest@example.com", {"status": "standby"}),
-        ("create", "new_1@example.com"),
         ("remove", "acc1@example.com"),
         ("update", "acc1@example.com", {"status": "standby"}),
+        ("create", "new_1@example.com"),
         ("create", "new_2@example.com"),
         ("sync_to_cpa", None)
     ]

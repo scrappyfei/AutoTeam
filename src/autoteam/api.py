@@ -1270,6 +1270,7 @@ class CleanupParams(BaseModel):
 
 class AddParams(BaseModel):
     count: int = 1
+    concurrency: int = 1
 
 
 class AdminEmailParams(BaseModel):
@@ -2655,7 +2656,13 @@ def post_add(params: AddParams = AddParams()):
 
     from autoteam.manager import cmd_add
 
-    task = _start_task("add", cmd_add, {"count": params.count}, params.count)
+    task = _start_task(
+        "add",
+        cmd_add,
+        {"count": params.count, "concurrency": params.concurrency},
+        params.count,
+        params.concurrency,
+    )
     return task
 
 

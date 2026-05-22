@@ -29,6 +29,13 @@
         <label for="prioritize-new" class="text-sm text-gray-400 cursor-pointer select-none">优先新建账号</label>
       </div>
 
+      <!-- 并发数量选项 -->
+      <div v-if="pendingAction && pendingAction.key === 'add'" class="flex items-center gap-1.5 ml-1">
+        <label class="text-sm text-gray-400">并发数:</label>
+        <input v-model.number="concurrencyValue" type="number" min="1" max="10"
+          class="w-16 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
+      </div>
+
       <button @click="confirmAction" :disabled="pendingAction && isDisabled(pendingAction)"
         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
         确认执行
@@ -78,6 +85,7 @@ const showParams = ref(false)
 const paramLabel = ref('')
 const paramValue = ref(5)
 const prioritizeNew = ref(false)
+const concurrencyValue = ref(1)
 const pendingAction = ref(null)
 const message = ref('')
 const messageClass = ref('')
@@ -124,6 +132,8 @@ async function confirmAction() {
   if (pendingAction.value) {
     if (pendingAction.value.key === 'fill') {
       await doExecute(pendingAction.value, { target: paramValue.value, prioritizeNew: prioritizeNew.value })
+    } else if (pendingAction.value.key === 'add') {
+      await doExecute(pendingAction.value, { count: paramValue.value, concurrency: concurrencyValue.value })
     } else {
       await doExecute(pendingAction.value, paramValue.value)
     }
@@ -142,6 +152,8 @@ async function doExecute(action, param) {
       let result
       if (action.key === 'fill') {
         result = await api[action.method](param.target, param.prioritizeNew)
+      } else if (action.key === 'add') {
+        result = await api[action.method](param.count, param.concurrency)
       } else {
         result = await api[action.method](param)
       }

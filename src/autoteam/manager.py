@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -2926,83 +2927,105 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
-def cmd_add(count: int = 1):
-    """手动添加新账号，支持循环添加且每次先踢出最低额度 active 账号"""
+def cmd_add(count: int = 1, concurrency: int = 1):
+    """手动添加新账号，支持循环/并发添加且每次先踢出最低额度 active 账号"""
     _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
-    mail_client = CloudMailClient()
-    mail_client.login()
 
     success_count = 0
     evicted_count = 0
+    success_lock = threading.Lock()
 
     try:
-        while success_count < count:
-            _abort_if_cancel_requested()
+        # 1. 先一次性踢出 count 个最低额度的账号，释放空位
+        active_accounts = [
+            a
+            for a in load_accounts()
+            if a["status"] == STATUS_ACTIVE
+            and not _is_main_account_email(a.get("email"))
+            and not is_account_disabled(a)
+        ]
 
-            # 1. 只有在需要为当前替换槽腾出空间时才踢人
-            if evicted_count < count and success_count == evicted_count:
-                active_accounts = [
-                    a
-                    for a in load_accounts()
-                    if a["status"] == STATUS_ACTIVE
-                    and not _is_main_account_email(a.get("email"))
-                    and not is_account_disabled(a)
-                ]
+        if active_accounts:
+            # 按照剩余 5h 额度升序排序：primary_pct 越大，说明用得越多，剩余额度越小
+            active_accounts.sort(
+                key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0)
+            )
+            to_evict = active_accounts[:count]
+            for evict_acc in to_evict:
+                email_to_remove = evict_acc["email"]
+                logger.info(
+                    "[添加] 发现额度最低 of 活跃账号: %s，准备移出以释放席位 (第 %d/%d 个替换槽)",
+                    email_to_remove,
+                    evicted_count + 1,
+                    count,
+                )
 
-                if active_accounts:
-                    # 按照剩余 5h 额度升序排序：primary_pct 越大，说明用得越多，剩余额度越小
-                    active_accounts.sort(
-                        key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0)
-                    )
-                    evict_acc = active_accounts[0]
-                    email_to_remove = evict_acc["email"]
+                if not _chatgpt_session_ready(chatgpt):
+                    chatgpt.start()
 
-                    logger.info(
-                        "[添加] 发现额度最低 of 活跃账号: %s，准备移出以释放席位 (第 %d/%d 个替换槽)",
-                        email_to_remove,
-                        evicted_count + 1,
-                        count,
-                    )
-
-                    if not _chatgpt_session_ready(chatgpt):
-                        chatgpt.start()
-
-                    remove_status = remove_from_team(chatgpt, email_to_remove, return_status=True)
-                    if remove_status in ("removed", "already_absent"):
-                        update_account(email_to_remove, status=STATUS_STANDBY)
-                        logger.info("[添加] 账号移出成功: %s -> standby", email_to_remove)
-                        evicted_count += 1
-                    else:
-                        logger.error("[添加] 移出账号 %s 失败，终止后续添加流程", email_to_remove)
-                        break
-                else:
-                    logger.info("[添加] 当前无活跃账号需移出，直接尝试添加新账号")
+                remove_status = remove_from_team(chatgpt, email_to_remove, return_status=True)
+                if remove_status in ("removed", "already_absent"):
+                    update_account(email_to_remove, status=STATUS_STANDBY)
+                    logger.info("[添加] 账号移出成功: %s -> standby", email_to_remove)
                     evicted_count += 1
+                else:
+                    logger.warning("[添加] 移出账号 %s 失败，但继续尝试添加流程", email_to_remove)
+                    evicted_count += 1
+        else:
+            logger.info("[添加] 当前无活跃账号需移出，直接尝试添加新账号")
 
-            # 2. 正常发起添加账号流程
-            result = None
-            try:
-                result = create_new_account(chatgpt, mail_client)
-            except Exception as exc:
-                logger.error("[添加] 创建新账号出现异常: %s", exc)
-
-            if result:
-                success_count += 1
-                logger.info("[添加] 新账号添加成功: %s (当前成功: %d/%d)", result, success_count, count)
-            else:
-                logger.warning("[添加] 添加账号失败，将尝试重新注册新账号...")
-                if success_count < count:
-                    time.sleep(10)
-
-        # 3. 统一同步一次 CPA 等远端状态
-        if success_count > 0:
-            logger.info("[添加] 成功添加 %d/%d 个账号，触发远端状态同步", success_count, count)
-            sync_to_cpa()
     finally:
         if _chatgpt_session_ready(chatgpt):
             chatgpt.stop()
+
+    # 2. 线程池并发注册
+    import concurrent.futures
+
+    def worker(worker_idx):
+        nonlocal success_count
+        w_mail_client = CloudMailClient()
+        w_mail_client.login()
+
+        while True:
+            _abort_if_cancel_requested()
+            with success_lock:
+                if success_count >= count:
+                    break
+
+            logger.info("[添加] [Worker-%d] 开始尝试创建新账号...", worker_idx)
+            result = None
+            try:
+                result = create_new_account(None, w_mail_client)
+            except Exception as exc:
+                logger.error("[添加] [Worker-%d] 创建新账号出现异常: %s", worker_idx, exc)
+
+            if result:
+                with success_lock:
+                    success_count += 1
+                    logger.info("[添加] [Worker-%d] 新账号添加成功: %s (当前成功: %d/%d)", worker_idx, result, success_count, count)
+                    if success_count >= count:
+                        break
+            else:
+                logger.warning("[添加] [Worker-%d] 添加账号失败，将尝试重新注册新账号...", worker_idx)
+                with success_lock:
+                    if success_count >= count:
+                        break
+                time.sleep(10)
+
+    # 启动并发数
+    workers = min(max(1, concurrency), count, 10)
+    logger.info("[添加] 启动并发注册线程数: %d，目标添加总数: %d", workers, count)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker, i + 1) for i in range(workers)]
+        # 等待所有线程完成
+        concurrent.futures.wait(futures)
+
+    # 3. 统一同步一次 CPA 等远端状态
+    if success_count > 0:
+        logger.info("[添加] 成功添加 %d/%d 个账号，触发远端状态同步", success_count, count)
+        sync_to_cpa()
 
 
 def cmd_manual_add():
