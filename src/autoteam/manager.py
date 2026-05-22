@@ -2210,8 +2210,8 @@ def create_account_direct(mail_client, chatgpt_api=None):
                 break
 
             if attempt < 2:
-                logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
-                time.sleep(60)
+                logger.warning("[直接注册] 注册失败且账号不在 Team 中，15 秒后重试: %s", email)
+                time.sleep(15)
 
         if not success:
             raise RuntimeError(f"连续 3 次注册尝试失败: {email}")
