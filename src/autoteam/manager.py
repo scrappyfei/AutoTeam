@@ -2880,66 +2880,74 @@ def cmd_add(count: int = 1):
     mail_client.login()
 
     success_count = 0
+    evicted_count = 0
+    failure_count = 0
+    max_failures = 3
+
     try:
-        for i in range(count):
+        while success_count < count:
             _abort_if_cancel_requested()
-            logger.info("[添加] 开始执行第 %d/%d 轮账号添加...", i + 1, count)
 
-            # 1. 查找 active 且额度最低的本地管理账号并剔除
-            active_accounts = [
-                a
-                for a in load_accounts()
-                if a["status"] == STATUS_ACTIVE
-                and not _is_main_account_email(a.get("email"))
-                and not is_account_disabled(a)
-            ]
+            if failure_count >= max_failures:
+                logger.error("[添加] 累计注册失败达到 %d 次，终止添加流程", max_failures)
+                break
 
-            if active_accounts:
-                # 按照剩余 5h 额度升序排序：primary_pct 越大，说明用得越多，剩余额度越小
-                active_accounts.sort(
-                    key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0)
-                )
-                evict_acc = active_accounts[0]
-                email_to_remove = evict_acc["email"]
+            # 1. 只有在需要为当前替换槽腾出空间时才踢人
+            if evicted_count < count and success_count == evicted_count:
+                active_accounts = [
+                    a
+                    for a in load_accounts()
+                    if a["status"] == STATUS_ACTIVE
+                    and not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                ]
 
-                logger.info(
-                    "[添加] [%d/%d] 发现额度最低的活跃账号: %s，准备移出以释放席位",
-                    i + 1,
-                    count,
-                    email_to_remove,
-                )
+                if active_accounts:
+                    # 按照剩余 5h 额度升序排序：primary_pct 越大，说明用得越多，剩余额度越小
+                    active_accounts.sort(
+                        key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0)
+                    )
+                    evict_acc = active_accounts[0]
+                    email_to_remove = evict_acc["email"]
 
-                if not _chatgpt_session_ready(chatgpt):
-                    chatgpt.start()
-
-                remove_status = remove_from_team(chatgpt, email_to_remove, return_status=True)
-                if remove_status in ("removed", "already_absent"):
-                    update_account(email_to_remove, status=STATUS_STANDBY)
                     logger.info(
-                        "[添加] [%d/%d] 账号移出成功: %s -> standby",
-                        i + 1,
-                        count,
+                        "[添加] 发现额度最低 of 活跃账号: %s，准备移出以释放席位 (第 %d/%d 个替换槽)",
                         email_to_remove,
+                        evicted_count + 1,
+                        count,
                     )
+
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+
+                    remove_status = remove_from_team(chatgpt, email_to_remove, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(email_to_remove, status=STATUS_STANDBY)
+                        logger.info("[添加] 账号移出成功: %s -> standby", email_to_remove)
+                        evicted_count += 1
+                    else:
+                        logger.error("[添加] 移出账号 %s 失败，终止后续添加流程", email_to_remove)
+                        break
                 else:
-                    logger.error(
-                        "[添加] [%d/%d] 移出账号 %s 失败，终止后续添加流程",
-                        i + 1,
-                        count,
-                        email_to_remove,
-                    )
-                    break
-            else:
-                logger.info("[添加] [%d/%d] 当前无活跃账号需移出，直接尝试添加新账号", i + 1, count)
+                    logger.info("[添加] 当前无活跃账号需移出，直接尝试添加新账号")
+                    evicted_count += 1
 
             # 2. 正常发起添加账号流程
-            result = create_new_account(chatgpt, mail_client)
+            result = None
+            try:
+                result = create_new_account(chatgpt, mail_client)
+            except Exception as exc:
+                logger.error("[添加] 创建新账号出现异常: %s", exc)
+
             if result:
                 success_count += 1
-                logger.info("[添加] [%d/%d] 新账号添加成功: %s", i + 1, count, result)
+                logger.info("[添加] 新账号添加成功: %s (当前成功: %d/%d)", result, success_count, count)
+                failure_count = 0
             else:
-                logger.error("[添加] [%d/%d] 添加账号失败，终止后续添加流程", i + 1, count)
-                break
+                failure_count += 1
+                logger.warning("[添加] 添加账号失败，将尝试重新注册新账号 (失败数: %d/%d)", failure_count, max_failures)
+                if success_count < count:
+                    time.sleep(5)
 
         # 3. 统一同步一次 CPA 等远端状态
         if success_count > 0:
@@ -3207,9 +3215,12 @@ def cmd_fill(target=5, prioritize_new=False):
         ]
         standby_index = 0
 
-        for i in range(need):
+        success_streak_failures = 0
+        max_total_failures = 3
+
+        while current < target and success_streak_failures < max_total_failures:
             _abort_if_cancel_requested()
-            logger.info("[填充] 添加第 %d/%d 个账号...", i + 1, need)
+            logger.info("[填充] 尝试补齐席位: 当前成员数 %d/%d...", current, target)
 
             added = False
 
@@ -3274,8 +3285,13 @@ def cmd_fill(target=5, prioritize_new=False):
                         chatgpt.start()
                     added = create_new_account(chatgpt, mail_client)
 
-            if not added:
-                logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)
+            if added:
+                success_streak_failures = 0
+            else:
+                success_streak_failures += 1
+                logger.warning("[填充] 本轮补位失败，将尝试重新补位 (连续失败数: %d/%d)", success_streak_failures, max_total_failures)
+                if current < target:
+                    time.sleep(5)
 
             # 验证成员数
             if not _chatgpt_session_ready(chatgpt):
@@ -3284,9 +3300,6 @@ def cmd_fill(target=5, prioritize_new=False):
             if new_count >= 0:
                 logger.info("[填充] 当前成员数: %d/%d", new_count, target)
                 current = new_count
-                if new_count >= target:
-                    logger.info("[填充] 当前成员数已达到目标，停止继续添加")
-                    break
 
         logger.info("[填充] 填充完成")
         sync_to_cpa()
