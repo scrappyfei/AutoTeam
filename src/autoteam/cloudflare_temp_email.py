@@ -186,7 +186,7 @@ class CloudflareTempEmailClient:
 
     def create_temp_email(self, prefix=None):
         if prefix is None:
-            prefix = f"tmp-{uuid.uuid4().hex[:8]}"
+            prefix = uuid.uuid4().hex[:10]
 
         payload = self._request(
             "POST",

@@ -75,7 +75,7 @@ class CloudMailClient:
     def create_temp_email(self, prefix=None):
         """创建临时邮箱地址，返回 (accountId, email)"""
         if prefix is None:
-            prefix = f"tmp-{uuid.uuid4().hex[:8]}"
+            prefix = uuid.uuid4().hex[:10]
         email = f"{prefix}@{self.domain}" if self.domain else prefix
 
         resp = self._post("/account/add", {"email": email})
