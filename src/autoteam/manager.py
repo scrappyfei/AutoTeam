@@ -1875,6 +1875,36 @@ def _complete_direct_about_you(page, signup_profile: SignupProfile | None = None
     return False
 
 
+def _extract_email_verification_link(email_data):
+    import re
+    import html
+
+    html_val = email_data.get("content", "") or ""
+    text_val = email_data.get("text", "") or ""
+    raw_val = str(email_data.get("raw") or "")
+
+    patterns = [
+        r'href="(https://auth\.openai\.com/u/signup/email-verification/verify\?[^"]*)"',
+        r'href="(https://auth\.openai\.com/u/signup/email-verification/[^"]*)"',
+        r'href="(https://auth\.openai\.com/u/signup/[^"]*)"',
+        r'href="(https?://[^"]*(?:email-verification|verify)[^"]*)"',
+        r'(https://auth\.openai\.com/u/signup/email-verification/verify\?[^\s<>"\']+)',
+        r'(https://auth\.openai\.com/u/signup/email-verification/[^\s<>"\']+)',
+        r'(https://auth\.openai\.com/u/signup/[^\s<>"\']+)',
+        r'(https?://[^\s<>"\']*(?:email-verification|verify)[^\s<>"\']*)',
+    ]
+
+    for pat in patterns:
+        links = re.findall(pat, html_val or text_val or raw_val)
+        if links:
+            for l in links:
+                l = html.unescape(l)
+                if "verify" in l or "ticket" in l:
+                    return l
+            return html.unescape(links[0])
+    return None
+
+
 def _register_direct_once(
     mail_client, email, password, mail_account_id=None, signup_profile: SignupProfile | None = None
 ):
@@ -2145,6 +2175,31 @@ def _register_direct_once(
                 logger.error("[直接注册] 未收到验证码")
                 browser.close()
                 return False
+        else:
+            if "email-verification" in page.url or current_step == "code":
+                logger.info("[直接注册] 未检测到验证码输入框，开始等待验证邮件以提取验证链接...")
+                verification_link = None
+                start_t = time.time()
+                while time.time() - start_t < MAIL_TIMEOUT:
+                    emails = mail_client.search_emails_by_recipient(email, size=10, account_id=mail_account_id)
+                    for em in emails:
+                        verification_link = _extract_email_verification_link(em)
+                        if verification_link:
+                            break
+                    if verification_link:
+                        break
+                    elapsed = int(time.time() - start_t)
+                    print(f"\r  等待验证邮件... ({elapsed}s)", end="", flush=True)
+                    time.sleep(3)
+
+                if verification_link:
+                    logger.info("[直接注册] 成功提取到验证链接，正在跳转: %s", verification_link)
+                    page.goto(verification_link, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(8)
+                else:
+                    logger.error("[直接注册] 未收到验证邮件或无法提取验证链接")
+                    browser.close()
+                    return False
 
         _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
