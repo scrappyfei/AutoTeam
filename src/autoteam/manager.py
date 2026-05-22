@@ -1018,12 +1018,24 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     auth_error_list = []
 
     if active_with_auth:
-        logger.info("[检查] 检查 %d 个 active/auth_pending 账号的额度...", len(active_with_auth))
-        for acc in active_with_auth:
+        logger.info("[检查] 并发检查 %d 个 active/auth_pending 账号的额度...", len(active_with_auth))
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _check_single(a):
+            try:
+                s, i = _check_and_refresh(a)
+                return a, s, i
+            except Exception as e:
+                logger.error("[检查] 账号 %s 检查额度发生异常: %s", a.get("email"), e)
+                return a, "error", None
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            check_results = list(executor.map(_check_single, active_with_auth))
+
+        for acc, status_str, info in check_results:
             _abort_if_cancel_requested()
             email = acc["email"]
             was_auth_pending = acc["status"] == STATUS_AUTH_PENDING
-            status_str, info = _check_and_refresh(acc)
 
             if status_str == "ok":
                 if isinstance(info, dict):
@@ -1319,65 +1331,69 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
     return status == 200
 
 
-def _complete_registration(email, password, invite_link, mail_client):
+def _complete_registration(email, password, invite_link, mail_client, chatgpt_api=None):
     """完成注册 + Codex 登录（从已有邀请链接继续）"""
     from playwright.sync_api import sync_playwright
-
     from autoteam.invite import register_with_invite
+    from autoteam.account_ops import delete_managed_account
 
     signup_profile = generate_signup_profile()
 
     logger.info("[注册] 开始注册 %s...", email)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-        result, password = register_with_invite(
-            page,
-            invite_link,
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+            result, password = register_with_invite(
+                page,
+                invite_link,
+                email,
+                mail_client,
+                password=password,
+                signup_profile=signup_profile,
+            )
+            browser.close()
+
+        if not result:
+            raise RuntimeError(f"注册流程失败: {email}")
+
+        # Codex 登录
+        login_result = _login_codex_with_result(
             email,
-            mail_client,
-            password=password,
+            password,
+            mail_client=mail_client,
             signup_profile=signup_profile,
         )
-        browser.close()
+        bundle = login_result.get("bundle")
+        if login_result.get("ok") and bundle:
+            auth_file = save_auth_file(bundle)
+            update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
+            _auth_repair_reset(email)
+            logger.info("[注册] 账号就绪: %s", email)
+            return email
+        else:
+            err_type = login_result.get("error_type") or "login_failed"
+            err_detail = login_result.get("error_detail") or "Codex 登录失败"
+            raise RuntimeError(f"注册后 Codex 登录失败: {err_type} - {err_detail}")
 
-    if not result:
-        logger.error("[注册] 注册 %s 失败", email)
-        return None
-
-    # Codex 登录
-    login_result = _login_codex_with_result(
-        email,
-        password,
-        mail_client=mail_client,
-        signup_profile=signup_profile,
-    )
-    bundle = login_result.get("bundle")
-    if login_result.get("ok") and bundle:
-        auth_file = save_auth_file(bundle)
-        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
-        _auth_repair_reset(email)
-        logger.info("[注册] 账号就绪: %s", email)
-        return email
-    else:
-        result = _record_auth_repair_failure(
-            email,
-            login_result.get("error_type"),
-            login_result.get("error_detail"),
-            release_team_seat=True,
-        )
-        extra = _auth_repair_result_suffix(result)
-        logger.warning(
-            "[注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
-            result.get("status"),
-            email,
-            _auth_repair_error_label(result.get("auth_last_error")),
-            extra,
-        )
+    except Exception as exc:
+        logger.error("[注册] 注册或登录流程发生异常，开始清理该账号: %s", exc)
+        try:
+            delete_managed_account(
+                email,
+                remove_remote=True,
+                remove_cloudmail=True,
+                sync_cpa_after=False,
+                chatgpt_api=chatgpt_api,
+                mail_client=mail_client,
+            )
+            logger.info("[注册] 异常清理完成: %s", email)
+        except Exception as cleanup_exc:
+            logger.error("[注册] 异常清理出错: %s", cleanup_exc)
         return None
 
 
@@ -1438,7 +1454,7 @@ def _check_pending_invites(chatgpt_api, mail_client):
         # 关闭 ChatGPT 浏览器再注册
         chatgpt_api.stop()
 
-        email = _complete_registration(inv_email, password, invite_link, mail_client)
+        email = _complete_registration(inv_email, password, invite_link, mail_client, chatgpt_api=chatgpt_api)
         if email:
             completed.append(email)
 
@@ -2162,85 +2178,91 @@ def _register_direct_once(
         return success
 
 
-def create_account_direct(mail_client):
+def create_account_direct(mail_client, chatgpt_api=None):
     """
     直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
     流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
     """
     import uuid
+    from autoteam.account_ops import delete_managed_account
 
     account_id, email = mail_client.create_temp_email()
     password = f"Tmp_{uuid.uuid4().hex[:12]}!"
     signup_profile = generate_signup_profile()
 
     success = False
-    for attempt in range(3):
-        logger.info("[直接注册] 开始第 %d/3 次注册尝试: %s", attempt + 1, email)
-        success = _register_direct_once(
-            mail_client,
+    try:
+        for attempt in range(3):
+            logger.info("[直接注册] 开始第 %d/3 次注册尝试: %s", attempt + 1, email)
+            success = _register_direct_once(
+                mail_client,
+                email,
+                password,
+                mail_account_id=account_id,
+                signup_profile=signup_profile,
+            )
+            if success:
+                break
+
+            if _is_email_in_team(email):
+                logger.info("[直接注册] 远端确认账号已在 Team 中，视为注册成功: %s", email)
+                success = True
+                break
+
+            if attempt < 2:
+                logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
+                time.sleep(60)
+
+        if not success:
+            raise RuntimeError(f"连续 3 次注册尝试失败: {email}")
+
+        add_account(
             email,
             password,
+            cloudmail_account_id=account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
+            mail_provider=getattr(mail_client, "provider_name", ""),
             mail_account_id=account_id,
+            mail_service_id=getattr(mail_client, "service_id", None),
+        )
+
+        # Step 4: Codex 登录
+        login_result = _login_codex_with_result(
+            email,
+            password,
+            mail_client=mail_client,
             signup_profile=signup_profile,
         )
-        if success:
-            break
+        bundle = login_result.get("bundle")
+        if login_result.get("ok") and bundle:
+            auth_file = save_auth_file(bundle)
+            update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
+            _auth_repair_reset(email)
+            logger.info("[直接注册] 账号就绪: %s", email)
+            return email
+        else:
+            err_type = login_result.get("error_type") or "login_failed"
+            err_detail = login_result.get("error_detail") or "Codex 登录失败"
+            raise RuntimeError(f"直接注册后 Codex 登录失败: {err_type} - {err_detail}")
 
-        if _is_email_in_team(email):
-            logger.info("[直接注册] 远端确认账号已在 Team 中，视为注册成功: %s", email)
-            success = True
-            break
-
-        if attempt < 2:
-            logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
-            time.sleep(60)
-
-    if not success:
-        logger.error("[直接注册] 连续 3 次注册失败，删除临时账号: %s", email)
+    except Exception as exc:
+        logger.error("[直接注册] 注册或登录流程发生异常，开始清理该账号: %s", exc)
+        try:
+            delete_managed_account(
+                email,
+                remove_remote=True,
+                remove_cloudmail=True,
+                sync_cpa_after=False,
+                chatgpt_api=chatgpt_api,
+                mail_client=mail_client,
+            )
+            logger.info("[直接注册] 异常清理完成: %s", email)
+        except Exception as cleanup_exc:
+            logger.error("[直接注册] 异常清理出错: %s", cleanup_exc)
+        # 兜底删除临时邮箱
         try:
             mail_client.delete_account(account_id)
-        except Exception as exc:
-            logger.warning("[直接注册] 删除失败临时邮箱异常: %s", exc)
-        return None
-
-    add_account(
-        email,
-        password,
-        cloudmail_account_id=account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
-        mail_provider=getattr(mail_client, "provider_name", ""),
-        mail_account_id=account_id,
-        mail_service_id=getattr(mail_client, "service_id", None),
-    )
-
-    # Step 4: Codex 登录
-    login_result = _login_codex_with_result(
-        email,
-        password,
-        mail_client=mail_client,
-        signup_profile=signup_profile,
-    )
-    bundle = login_result.get("bundle")
-    if login_result.get("ok") and bundle:
-        auth_file = save_auth_file(bundle)
-        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
-        _auth_repair_reset(email)
-        logger.info("[直接注册] 账号就绪: %s", email)
-        return email
-    else:
-        result = _record_auth_repair_failure(
-            email,
-            login_result.get("error_type"),
-            login_result.get("error_detail"),
-            release_team_seat=True,
-        )
-        extra = _auth_repair_result_suffix(result)
-        logger.warning(
-            "[直接注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
-            result.get("status"),
-            email,
-            _auth_repair_error_label(result.get("auth_last_error")),
-            extra,
-        )
+        except Exception:
+            pass
         return None
 
 
@@ -2261,7 +2283,7 @@ def create_new_account(chatgpt_api, mail_client):
     logger.info("[创建] 使用直接注册模式...")
     if _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
-    return create_account_direct(mail_client)
+    return create_account_direct(mail_client, chatgpt_api=chatgpt_api)
 
 
 def reinvite_account(chatgpt_api, mail_client, acc):

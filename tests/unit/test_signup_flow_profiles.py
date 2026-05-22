@@ -305,7 +305,7 @@ def test_create_account_direct_releases_team_seat_and_returns_none_when_oauth_fa
             return 123, "user@example.com"
 
         def delete_account(self, account_id):
-            raise AssertionError(f"unexpected delete_account({account_id})")
+            recorded["email_deleted"] = True
 
     monkeypatch.setattr(manager.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(manager, "generate_signup_profile", lambda: SignupProfile("Liam Parker", 1991, 9, 8, 34))
@@ -324,20 +324,20 @@ def test_create_account_direct_releases_team_seat_and_returns_none_when_oauth_fa
         },
     )
 
-    def fake_record(*args, **kwargs):
-        recorded["record_args"] = args
-        recorded["record_kwargs"] = kwargs
-        return {"status": "standby", "auth_last_error": "auth_code_missing", "seat_released": True}
+    from autoteam import account_ops
+    def fake_delete(email, **kwargs):
+        recorded["deleted_email"] = email
+        recorded["delete_kwargs"] = kwargs
 
-    monkeypatch.setattr(manager, "_record_auth_repair_failure", fake_record)
+    monkeypatch.setattr(account_ops, "delete_managed_account", fake_delete)
 
     result = manager.create_account_direct(_FakeMailClient())
 
     assert result is None
     assert recorded["added"] == ["user@example.com"]
-    assert recorded["record_args"][:3] == ("user@example.com", "auth_code_missing", "未获取到 auth code")
-    assert recorded["record_kwargs"]["release_team_seat"] is True
-
+    assert recorded["deleted_email"] == "user@example.com"
+    assert recorded["delete_kwargs"]["remove_remote"] is True
+    assert recorded["delete_kwargs"]["remove_cloudmail"] is True
 
 def test_complete_registration_reuses_one_profile_for_invite_and_oauth(monkeypatch):
     profile = SignupProfile("Owen Reed", 1989, 2, 10, 37)
@@ -394,19 +394,20 @@ def test_complete_registration_releases_team_seat_and_returns_none_when_oauth_fa
         },
     )
 
-    def fake_record(*args, **kwargs):
-        recorded["record_args"] = args
-        recorded["record_kwargs"] = kwargs
-        return {"status": "standby", "auth_last_error": "choose_account_selection", "seat_released": True}
+    from autoteam import account_ops
+    def fake_delete(email, **kwargs):
+        recorded["deleted_email"] = email
+        recorded["delete_kwargs"] = kwargs
 
-    monkeypatch.setattr(manager, "_record_auth_repair_failure", fake_record)
+    monkeypatch.setattr(account_ops, "delete_managed_account", fake_delete)
     monkeypatch.setattr(playwright_sync_api, "sync_playwright", lambda: _FakePlaywright(fake_page))
 
     result = manager._complete_registration("user@example.com", "pw", "https://invite", object())
 
     assert result is None
-    assert recorded["record_args"][:3] == ("user@example.com", "choose_account_selection", "卡在账号选择页")
-    assert recorded["record_kwargs"]["release_team_seat"] is True
+    assert recorded["deleted_email"] == "user@example.com"
+    assert recorded["delete_kwargs"]["remove_remote"] is True
+    assert recorded["delete_kwargs"]["remove_cloudmail"] is True
 
 
 def test_complete_invite_about_you_uses_profile_values(monkeypatch):

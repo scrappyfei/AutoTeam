@@ -1963,7 +1963,14 @@ def test_run_playwright_probe_kills_process_group_on_timeout(monkeypatch):
             killed.append("kill")
 
     monkeypatch.setattr(api.subprocess, "Popen", lambda *args, **kwargs: _FakeProc())
-    monkeypatch.setattr(api.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(api.signal, "SIGKILL", 9, raising=False)
+    import os
+    class FakeOS:
+        environ = os.environ
+        @staticmethod
+        def killpg(pid, sig):
+            killed.append((pid, sig))
+    monkeypatch.setattr(api, "os", FakeOS)
 
     with pytest.raises(TimeoutError):
         api._run_playwright_probe("team-member-count", timeout_seconds=0.01)

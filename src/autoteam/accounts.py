@@ -1,6 +1,7 @@
 """账号池管理 - 持久化存储所有账号状态"""
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from autoteam.textio import read_text, write_text
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
+
+_accounts_lock = threading.RLock()
 
 # 账号状态
 STATUS_ACTIVE = "active"  # 在 team 中，额度可用
@@ -44,19 +47,21 @@ def _normalize_account(acc: dict) -> dict:
 
 def load_accounts():
     """加载账号列表"""
-    if ACCOUNTS_FILE.exists():
-        text = read_text(ACCOUNTS_FILE).strip()
-        if text:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return [_normalize_account(acc) for acc in data if isinstance(acc, dict)]
-    return []
+    with _accounts_lock:
+        if ACCOUNTS_FILE.exists():
+            text = read_text(ACCOUNTS_FILE).strip()
+            if text:
+                data = json.loads(text)
+                if isinstance(data, list):
+                    return [_normalize_account(acc) for acc in data if isinstance(acc, dict)]
+        return []
 
 
 def save_accounts(accounts):
     """保存账号列表"""
-    normalized = [_normalize_account(acc) for acc in accounts if isinstance(acc, dict)]
-    write_text(ACCOUNTS_FILE, json.dumps(normalized, indent=2, ensure_ascii=False))
+    with _accounts_lock:
+        normalized = [_normalize_account(acc) for acc in accounts if isinstance(acc, dict)]
+        write_text(ACCOUNTS_FILE, json.dumps(normalized, indent=2, ensure_ascii=False))
 
 
 def find_account(accounts, email):
@@ -77,55 +82,57 @@ def add_account(
     mail_service_id=None,
 ):
     """添加新账号"""
-    accounts = load_accounts()
-    if find_account(accounts, email):
-        return  # 已存在
+    with _accounts_lock:
+        accounts = load_accounts()
+        if find_account(accounts, email):
+            return  # 已存在
 
-    if mail_account_id is None:
-        mail_account_id = cloudmail_account_id
-    resolved_mail_provider = mail_provider or (get_mail_provider_name() if mail_account_id is not None else "")
-    mail_fields = (
-        build_account_mail_fields(mail_account_id, provider=resolved_mail_provider, service_id=mail_service_id)
-        if mail_account_id is not None
-        else {
-            "mail_provider": resolved_mail_provider,
-            "mail_service_id": mail_service_id,
-            "mail_account_id": None,
-            "cloudmail_account_id": cloudmail_account_id,
-        }
-    )
+        if mail_account_id is None:
+            mail_account_id = cloudmail_account_id
+        resolved_mail_provider = mail_provider or (get_mail_provider_name() if mail_account_id is not None else "")
+        mail_fields = (
+            build_account_mail_fields(mail_account_id, provider=resolved_mail_provider, service_id=mail_service_id)
+            if mail_account_id is not None
+            else {
+                "mail_provider": resolved_mail_provider,
+                "mail_service_id": mail_service_id,
+                "mail_account_id": None,
+                "cloudmail_account_id": cloudmail_account_id,
+            }
+        )
 
-    accounts.append(
-        {
-            "email": email,
-            "password": password,
-            **mail_fields,
-            "status": STATUS_PENDING,
-            "auth_file": None,  # CPA 认证文件路径
-            "quota_exhausted_at": None,  # 额度用完的时间
-            "quota_resets_at": None,  # 额度恢复时间
-            "created_at": time.time(),
-            "last_active_at": None,
-            "auth_retry_count": 0,
-            "auth_last_error": None,
-            "auth_last_error_detail": None,
-            "auth_last_failed_at": None,
-            "auth_retry_after": None,
-            "auth_retry_paused": False,
-            "disabled": False,
-        }
-    )
-    save_accounts(accounts)
+        accounts.append(
+            {
+                "email": email,
+                "password": password,
+                **mail_fields,
+                "status": STATUS_PENDING,
+                "auth_file": None,  # CPA 认证文件路径
+                "quota_exhausted_at": None,  # 额度用完的时间
+                "quota_resets_at": None,  # 额度恢复时间
+                "created_at": time.time(),
+                "last_active_at": None,
+                "auth_retry_count": 0,
+                "auth_last_error": None,
+                "auth_last_error_detail": None,
+                "auth_last_failed_at": None,
+                "auth_retry_after": None,
+                "auth_retry_paused": False,
+                "disabled": False,
+            }
+        )
+        save_accounts(accounts)
 
 
 def update_account(email, **kwargs):
     """更新账号字段"""
-    accounts = load_accounts()
-    acc = find_account(accounts, email)
-    if acc:
-        acc.update(kwargs)
-        save_accounts(accounts)
-    return acc
+    with _accounts_lock:
+        accounts = load_accounts()
+        acc = find_account(accounts, email)
+        if acc:
+            acc.update(kwargs)
+            save_accounts(accounts)
+        return acc
 
 
 def get_active_accounts():
