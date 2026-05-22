@@ -2951,6 +2951,7 @@ def cmd_add(count: int = 1, concurrency: int = 1):
     chatgpt.start()
 
     success_count = 0
+    in_progress_count = 0
     evicted_count = 0
     success_lock = threading.Lock()
 
@@ -3005,7 +3006,7 @@ def cmd_add(count: int = 1, concurrency: int = 1):
     shared_mail_client.login()
 
     def worker(worker_idx):
-        nonlocal success_count
+        nonlocal success_count, in_progress_count
         _worker_log_local.worker_prefix = f"[Worker-{worker_idx}]"
 
         while True:
@@ -3013,6 +3014,10 @@ def cmd_add(count: int = 1, concurrency: int = 1):
             with success_lock:
                 if success_count >= count:
                     break
+                if success_count + in_progress_count >= count:
+                    # 如果当前已成功数与进行中的任务数总和已达到目标数量，此线程退出，避免产生冗余账号
+                    break
+                in_progress_count += 1
 
             logger.info("[添加] [Worker-%d] 开始尝试创建新账号...", worker_idx)
             result = None
@@ -3020,6 +3025,9 @@ def cmd_add(count: int = 1, concurrency: int = 1):
                 result = create_new_account(None, shared_mail_client)
             except Exception as exc:
                 logger.error("[添加] [Worker-%d] 创建新账号出现异常: %s", worker_idx, exc)
+            finally:
+                with success_lock:
+                    in_progress_count -= 1
 
             if result:
                 with success_lock:
