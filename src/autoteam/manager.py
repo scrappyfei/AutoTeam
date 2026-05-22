@@ -2881,16 +2881,10 @@ def cmd_add(count: int = 1):
 
     success_count = 0
     evicted_count = 0
-    failure_count = 0
-    max_failures = 3
 
     try:
         while success_count < count:
             _abort_if_cancel_requested()
-
-            if failure_count >= max_failures:
-                logger.error("[添加] 累计注册失败达到 %d 次，终止添加流程", max_failures)
-                break
 
             # 1. 只有在需要为当前替换槽腾出空间时才踢人
             if evicted_count < count and success_count == evicted_count:
@@ -2942,12 +2936,10 @@ def cmd_add(count: int = 1):
             if result:
                 success_count += 1
                 logger.info("[添加] 新账号添加成功: %s (当前成功: %d/%d)", result, success_count, count)
-                failure_count = 0
             else:
-                failure_count += 1
-                logger.warning("[添加] 添加账号失败，将尝试重新注册新账号 (失败数: %d/%d)", failure_count, max_failures)
+                logger.warning("[添加] 添加账号失败，将尝试重新注册新账号...")
                 if success_count < count:
-                    time.sleep(5)
+                    time.sleep(10)
 
         # 3. 统一同步一次 CPA 等远端状态
         if success_count > 0:
@@ -3215,10 +3207,7 @@ def cmd_fill(target=5, prioritize_new=False):
         ]
         standby_index = 0
 
-        success_streak_failures = 0
-        max_total_failures = 3
-
-        while current < target and success_streak_failures < max_total_failures:
+        while current < target:
             _abort_if_cancel_requested()
             logger.info("[填充] 尝试补齐席位: 当前成员数 %d/%d...", current, target)
 
@@ -3285,13 +3274,10 @@ def cmd_fill(target=5, prioritize_new=False):
                         chatgpt.start()
                     added = create_new_account(chatgpt, mail_client)
 
-            if added:
-                success_streak_failures = 0
-            else:
-                success_streak_failures += 1
-                logger.warning("[填充] 本轮补位失败，将尝试重新补位 (连续失败数: %d/%d)", success_streak_failures, max_total_failures)
+            if not added:
+                logger.warning("[填充] 本轮补位失败，将尝试重新补位...")
                 if current < target:
-                    time.sleep(5)
+                    time.sleep(10)
 
             # 验证成员数
             if not _chatgpt_session_ready(chatgpt):
