@@ -205,3 +205,25 @@ def get_playwright_launch_options():
         options["proxy"] = proxy
 
     return options
+
+
+def setup_context_optimize(context):
+    """设置 Playwright Context 资源请求过滤，拦截图片、视频和字体文件以节省流量和 CPU 开销。"""
+    def block_resources(route):
+        try:
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        context.route("**/*", block_resources)
+    except Exception:
+        pass
+    return context
+
