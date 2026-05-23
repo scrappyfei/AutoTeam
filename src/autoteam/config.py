@@ -239,55 +239,52 @@ def setup_context_optimize(context):
 
 
 def create_optimized_context(browser, **extra_kwargs):
-    """创建并配置具备混淆指纹、资源拦截和自动化伪装的 Playwright BrowserContext"""
-    import random
+    """
+    智能配置 Playwright BrowserContext。
+    在 headful 模式下：保留浏览器原生的完美指纹（真实 UA、设备分辨率、物理显卡、时区等），避免人工伪装带来特征冲突。
+    在 headless 模式下：对 Headless 特征（如 HeadlessChrome User-Agent、SwiftShader 虚拟显卡、navigator.webdriver）进行高保真无痕伪装。
+    """
+    import os
 
-    # 真实 User-Agent 范围（选取主流 Windows / macOS Chrome 版本 128~134 之间）
-    os_versions = [
-        "Windows NT 10.0; Win64; x64",
-        "Macintosh; Intel Mac OS X 10_15_7"
-    ]
-    chrome_ver = random.randint(128, 134)
-    build_ver = random.randint(1000, 9999)
-    patch_ver = random.randint(100, 199)
-    os_spec = random.choice(os_versions)
-    ua = f"Mozilla/5.0 ({os_spec}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.{build_ver}.{patch_ver} Safari/537.36"
-
-    # 随机屏幕视口大小
-    viewports = [
-        {"width": 1366, "height": 768},
-        {"width": 1440, "height": 900},
-        {"width": 1536, "height": 864},
-        {"width": 1920, "height": 1080}
-    ]
-    viewport = random.choice(viewports)
-    device_scale_factor = random.choice([1, 1.25, 1.5, 2])
-
-    # 随机常用语言和时区
-    locales_timezones = [
-        ("en-US", "America/New_York"),
-        ("en-GB", "Europe/London"),
-        ("zh-CN", "Asia/Shanghai"),
-    ]
-    locale, timezone_id = random.choice(locales_timezones)
+    is_headless = os.environ.get("PLAYWRIGHT_HEADLESS", "False").lower() in ("true", "1")
 
     context_args = {
-        "user_agent": ua,
-        "viewport": viewport,
-        "device_scale_factor": device_scale_factor,
-        "locale": locale,
-        "timezone_id": timezone_id,
         "accept_downloads": True,
     }
-    # 允许显式传递的额外参数覆盖默认指纹
+
+    if is_headless:
+        # 1. 抽取真实浏览器版本，对齐 UA 版本，防止 navigator.userAgentData 版本冲突
+        browser_ver = browser.version or "148.0.0.0"
+        # 统一使用 Windows NT 10.0 作为 Headless 的高保真伪装系统（契合大多数部署环境）
+        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browser_ver} Safari/537.36"
+        context_args["user_agent"] = ua
+
+        # 2. 随机设置常见分辨率，防止固定的 1280x800 特征被标记
+        import random
+        viewports = [
+            {"width": 1366, "height": 768},
+            {"width": 1440, "height": 900},
+            {"width": 1536, "height": 864},
+            {"width": 1920, "height": 1080}
+        ]
+        context_args["viewport"] = random.choice(viewports)
+        context_args["device_scale_factor"] = random.choice([1, 1.25, 1.5, 2])
+        
+        # 3. 设置默认 Locale 和时区
+        context_args["locale"] = "zh-CN"
+        context_args["timezone_id"] = "Asia/Shanghai"
+
+    # 允许显式传递的参数覆盖默认指纹
     context_args.update(extra_kwargs)
 
     context = browser.new_context(**context_args)
-    
-    # 资源优化拦截（图片、视频、字体过滤）
-    setup_context_optimize(context)
 
-    # 注入无痕伪装 Stealth JS 脚本
+    # 4. 路由资源拦截优化（默认关闭，仅在显式开启 optimize_routes 时生效）
+    # 注：注册、邀请等流程包含大量 Cloudflare Turnstile 验证，强行 abort 资源容易引起 CF 风控检测，因此默认不开启路由拦截优化。
+    if extra_kwargs.get("optimize_routes"):
+        setup_context_optimize(context)
+
+    # 5. 注入高保真反检测 Stealth 脚本（内含 WebGL 智能降级/伪装）
     stealth_script = """
     // 隐藏 automation 属性 webdriver
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -330,23 +327,37 @@ def create_optimized_context(browser, **extra_kwargs):
       );
     }
 
-    // 伪装 WebGL 渲染硬件信息
-    const mockWebGL = (glContext) => {
-      const getParameter = glContext.prototype.getParameter;
-      glContext.prototype.getParameter = function(parameter) {
-        // UNMASKED_VENDOR_WEBGL
-        if (parameter === 37445) {
-          return 'Intel Open Source Technology Center';
-        }
-        // UNMASKED_RENDERER_WEBGL
-        if (parameter === 37446) {
-          return 'Mesa DRI Intel(R) UHD Graphics (CML GT2)';
-        }
-        return getParameter.call(this, parameter);
-      };
-    };
-    if (window.WebGLRenderingContext) mockWebGL(WebGLRenderingContext);
-    if (window.WebGL2RenderingContext) mockWebGL(WebGL2RenderingContext);
+    // 智能伪装 WebGL 渲染硬件信息（仅当检测到虚拟/软件渲染器时，才覆盖为物理显卡）
+    (() => {
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!gl) return;
+      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      if (!debugInfo) return;
+      const nativeRenderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || '';
+      const nativeVendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) || '';
+      
+      const isVirtual = /swiftshader|llvmpipe|virtual|mesa|google|software/i.test(nativeRenderer) || 
+                        /google/i.test(nativeVendor);
+      
+      if (isVirtual) {
+        const mockWebGL = (glContext) => {
+          const getParameter = glContext.prototype.getParameter;
+          glContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
+              return 'Google Inc. (Intel)';
+            }
+            if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
+               return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            }
+            return getParameter.call(this, parameter);
+          };
+        };
+        if (window.WebGLRenderingContext) mockWebGL(WebGLRenderingContext);
+        if (window.WebGL2RenderingContext) mockWebGL(WebGL2RenderingContext);
+      }
+    })();
+    StealthScriptMarker = true;
     """
     
     context.add_init_script(stealth_script)
