@@ -57,7 +57,7 @@ from autoteam.codex_auth import (
     refresh_access_token,
     save_auth_file,
 )
-from autoteam.config import get_playwright_launch_options, setup_context_optimize
+from autoteam.config import get_playwright_launch_options, setup_context_optimize, create_optimized_context
 from autoteam.cpa_sync import sync_from_cpa
 from autoteam.mail_provider import (
     get_account_mail_provider,
@@ -1030,7 +1030,7 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                 logger.error("[检查] 账号 %s 检查额度发生异常: %s", a.get("email"), e)
                 return a, "error", None
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(active_with_auth), 20)) as executor:
             check_results = list(executor.map(_check_single, active_with_auth))
 
         for acc, status_str, info in check_results:
@@ -1184,19 +1184,53 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     # auth_error + 无认证文件的统一重新登录 Codex
     if auth_error_list:
         logger.info("[检查] 重新登录 %d 个认证失效/待修复的账号...", len(auth_error_list))
+        
+        # 在主线程中提前完成所有涉及的邮箱客户端的登录，避免并发登录冲突
         mail_clients = {}
         for acc in auth_error_list:
+            cache_key = _account_mail_cache_key(acc)
+            if cache_key not in mail_clients:
+                try:
+                    client = _get_account_mail_client(acc)
+                    client.login()
+                    mail_clients[cache_key] = client
+                except Exception as e:
+                    logger.error("[检查] 邮箱客户端 %s 登录失败: %s", cache_key, e)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _repair_single(acc):
             _abort_if_cancel_requested()
             email = acc["email"]
             password = acc.get("password", "")
             logger.info("[%s] 重新 Codex 登录...", email)
+
             cache_key = _account_mail_cache_key(acc)
             mail_client = mail_clients.get(cache_key)
             if mail_client is None:
-                mail_client = _get_account_mail_client(acc)
-                mail_client.login()
-                mail_clients[cache_key] = mail_client
-            login_result = _login_codex_with_result(email, password, mail_client=mail_client)
+                try:
+                    mail_client = _get_account_mail_client(acc)
+                    mail_client.login()
+                except Exception as e:
+                    logger.error("[%s] 获取邮箱客户端失败: %s", email, e)
+                    return acc, {"ok": False, "error_detail": f"邮箱客户端登录失败: {e}"}
+
+            try:
+                login_result = _login_codex_with_result(email, password, mail_client=mail_client)
+                return acc, login_result
+            except Exception as e:
+                logger.error("[%s] 登录修复过程发生异常: %s", email, e)
+                return acc, {"ok": False, "error_detail": str(e)}
+
+        repair_workers = min(len(auth_error_list), 3)
+        logger.info("[检查] 启动 %d 个并发修复线程...", repair_workers)
+        with ThreadPoolExecutor(max_workers=repair_workers) as executor:
+            repair_results = list(executor.map(_repair_single, auth_error_list))
+
+        # 在主线程中串行处理结果并更新 JSON，确保文件写入安全
+        for acc, login_result in repair_results:
+            _abort_if_cancel_requested()
+            email = acc["email"]
             bundle = login_result.get("bundle")
             if login_result.get("ok") and bundle:
                 auth_file = save_auth_file(bundle)
@@ -1204,53 +1238,56 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                 _auth_repair_reset(email)
                 logger.info("[%s] token 已更新", email)
                 # 重新检查额度
-                status_str, info = _check_and_refresh(find_account(load_accounts(), email))
-                if status_str == "exhausted":
-                    quota_info = quota_result_quota_info(info)
-                    if quota_info:
-                        update_account(email, last_quota=quota_info)
-                    update_account(
-                        email,
-                        status=STATUS_EXHAUSTED,
-                        quota_exhausted_at=time.time(),
-                        quota_resets_at=quota_result_resets_at(info) or int(time.time() + 18000),
-                    )
-                    exhausted_list.append(acc)
-                    logger.warning("[%s] 额度已用完", email)
-                elif status_str == "ok" and isinstance(info, dict):
-                    p_remain = 100 - info.get("primary_pct", 0)
-                    update_account(email, last_quota=info)
-                    if p_remain < threshold:
-                        resets_at = info.get("primary_resets_at") or (time.time() + 18000)
-                        logger.warning("[%s] 5h剩余 %d%% < %d%%，标记为 exhausted", email, p_remain, threshold)
+                try:
+                    status_str, info = _check_and_refresh(find_account(load_accounts(), email))
+                    if status_str == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            update_account(email, last_quota=quota_info)
                         update_account(
                             email,
                             status=STATUS_EXHAUSTED,
                             quota_exhausted_at=time.time(),
-                            quota_resets_at=resets_at,
+                            quota_resets_at=quota_result_resets_at(info) or int(time.time() + 18000),
                         )
                         exhausted_list.append(acc)
-                    else:
+                        logger.warning("[%s] 额度已用完", email)
+                    elif status_str == "ok" and isinstance(info, dict):
+                        p_remain = 100 - info.get("primary_pct", 0)
+                        update_account(email, last_quota=info)
+                        if p_remain < threshold:
+                            resets_at = info.get("primary_resets_at") or (time.time() + 18000)
+                            logger.warning("[%s] 5h剩余 %d%% < %d%%，标记为 exhausted", email, p_remain, threshold)
+                            update_account(
+                                email,
+                                status=STATUS_EXHAUSTED,
+                                quota_exhausted_at=time.time(),
+                                quota_resets_at=resets_at,
+                            )
+                            exhausted_list.append(acc)
+                        else:
+                            _auth_repair_reset(email)
+                            update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                            logger.info("[%s] 额度可用 (%d%%)", email, p_remain)
+                    elif status_str == "ok":
                         _auth_repair_reset(email)
                         update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
-                        logger.info("[%s] 额度可用 (%d%%)", email, p_remain)
-                elif status_str == "ok":
-                    _auth_repair_reset(email)
-                    update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
-                    logger.info("[%s] 额度可用", email)
-                elif status_str == "auth_error":
-                    result = _record_auth_repair_failure(
-                        email,
-                        login_result.get("error_type") or "non_team_plan",
-                        login_result.get("error_detail") or "重新登录后仍无法查询额度",
-                    )
-                    extra = _auth_repair_result_suffix(result)
-                    logger.warning(
-                        "[%s] 重新登录后仍无法查询额度（可能未选中 Team workspace），标记为 %s%s",
-                        email,
-                        result.get("status"),
-                        extra,
-                    )
+                        logger.info("[%s] 额度可用", email)
+                    elif status_str == "auth_error":
+                        result = _record_auth_repair_failure(
+                            email,
+                            login_result.get("error_type") or "non_team_plan",
+                            login_result.get("error_detail") or "重新登录后仍无法查询额度",
+                        )
+                        extra = _auth_repair_result_suffix(result)
+                        logger.warning(
+                            "[%s] 重新登录后仍无法查询额度（可能未选中 Team workspace），标记为 %s%s",
+                            email,
+                            result.get("status"),
+                            extra,
+                        )
+                except Exception as e:
+                    logger.error("[%s] 重新检查额度发生异常: %s", email, e)
             else:
                 result = _record_auth_repair_failure(
                     email,
@@ -1334,7 +1371,7 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
 
 def _complete_registration(email, password, invite_link, mail_client, chatgpt_api=None):
     """完成注册 + Codex 登录（从已有邀请链接继续）"""
-    from playwright.sync_api import sync_playwright
+    from autoteam.browser_pool import get_pooled_browser
     from autoteam.invite import register_with_invite
     from autoteam.account_ops import delete_managed_account
 
@@ -1342,13 +1379,9 @@ def _complete_registration(email, password, invite_link, mail_client, chatgpt_ap
 
     logger.info("[注册] 开始注册 %s...", email)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(**get_playwright_launch_options())
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            )
-            setup_context_optimize(context)
+        browser = get_pooled_browser()
+        context = create_optimized_context(browser)
+        try:
             page = context.new_page()
             result, password = register_with_invite(
                 page,
@@ -1358,7 +1391,8 @@ def _complete_registration(email, password, invite_link, mail_client, chatgpt_ap
                 password=password,
                 signup_profile=signup_profile,
             )
-            browser.close()
+        finally:
+            context.close()
 
         if not result:
             raise RuntimeError(f"注册流程失败: {email}")
@@ -1911,23 +1945,17 @@ def _register_direct_once(
     mail_client, email, password, mail_account_id=None, signup_profile: SignupProfile | None = None
 ):
     """执行一次直接注册，返回是否完成注册并进入 Team。"""
-    from playwright.sync_api import sync_playwright
+    from autoteam.browser_pool import get_pooled_browser
 
     signup_profile = signup_profile or generate_signup_profile()
 
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
 
-    with sync_playwright() as p:
-        launch_kwargs = get_playwright_launch_options()
-        if sys.platform.startswith("win"):
-            launch_kwargs["slow_mo"] = 100
-        browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        setup_context_optimize(context)
+    browser = get_pooled_browser()
+    context = create_optimized_context(browser)
+
+    try:
         page = context.new_page()
 
         page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
@@ -1990,11 +2018,9 @@ def _register_direct_once(
 
         if email_step == "google":
             logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
-            browser.close()
             return False
         if email_step == "unknown":
             logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
 
         try:
@@ -2052,19 +2078,15 @@ def _register_direct_once(
         logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
         if current_step == "google":
             logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
-            browser.close()
             return False
         if current_step == "error":
             logger.warning("[直接注册] 邮箱步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
         if current_step == "unknown":
             logger.warning("[直接注册] 邮箱步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
         if current_step == "email":
             logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
 
         # 等待页面跳转完成（可能跳到 create-account/password）
@@ -2077,11 +2099,9 @@ def _register_direct_once(
         _safe_invite_screenshot(page, "direct_03b_before_password.png")
         if password_step == "error":
             logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
         if password_step == "unknown":
             logger.warning("[直接注册] 无法识别密码/验证码步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
 
         try:
@@ -2129,19 +2149,15 @@ def _register_direct_once(
         current_step = _detect_direct_register_step(page)
         if current_step == "google":
             logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
-            browser.close()
             return False
         if current_step == "error":
             logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
         if current_step == "unknown":
             logger.warning("[直接注册] 密码步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
         if current_step == "email":
             logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
-            browser.close()
             return False
 
         code_input = None
@@ -2176,7 +2192,6 @@ def _register_direct_once(
                 time.sleep(8)
             else:
                 logger.error("[直接注册] 未收到验证码")
-                browser.close()
                 return False
         else:
             if "email-verification" in page.url or current_step == "code":
@@ -2201,7 +2216,6 @@ def _register_direct_once(
                     time.sleep(8)
                 else:
                     logger.error("[直接注册] 未收到验证邮件或无法提取验证链接")
-                    browser.close()
                     return False
 
         _safe_invite_screenshot(page, "direct_05_after_code.png")
@@ -2232,8 +2246,9 @@ def _register_direct_once(
         else:
             logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
 
-        browser.close()
         return success
+    finally:
+        context.close()
 
 
 def create_account_direct(mail_client, chatgpt_api=None):
@@ -3573,9 +3588,14 @@ def cmd_reset_quota_recovery():
 
         if changed:
             updated_accounts += 1
-
-    if updated_accounts:
-        save_accounts(accounts)
+            update_account(
+                acc["email"],
+                last_quota=None,
+                quota_resets_at=None,
+                quota_exhausted_at=None,
+                quota_window=None,
+                status=acc.get("status"),
+            )
 
     summary = {
         "total_accounts": total_accounts,

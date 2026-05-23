@@ -20,7 +20,7 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
-from autoteam.config import get_playwright_launch_options, setup_context_optimize
+from autoteam.config import get_playwright_launch_options, setup_context_optimize, create_optimized_context
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.textio import write_text
 
@@ -843,13 +843,10 @@ def login_codex_via_browser(
     auth_code = None
     failure_result = None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        setup_context_optimize(context)
+    from autoteam.browser_pool import get_pooled_browser
+    browser = get_pooled_browser()
+    context = create_optimized_context(browser)
+    try:
 
         # === Step 0: 先登录 ChatGPT 并切换到 Team workspace ===
         # 登录前就注入 _account cookie，引导登录流程进入 Team workspace
@@ -1231,8 +1228,9 @@ def login_codex_via_browser(
                 "current_url": page.url,
                 "body_excerpt": body_excerpt,
             }
-
-        browser.close()
+        pass
+    finally:
+        context.close()
 
     if not auth_code:
         detail = (
@@ -1829,14 +1827,35 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     }
 
 
+_codex_session = None
+_codex_session_lock = None
+
+
+def _get_codex_session():
+    global _codex_session, _codex_session_lock
+    if _codex_session_lock is None:
+        import threading
+        _codex_session_lock = threading.Lock()
+    if _codex_session is None:
+        with _codex_session_lock:
+            if _codex_session is None:
+                import requests
+                from requests.adapters import HTTPAdapter
+                s = requests.Session()
+                # Support high concurrency connection reuse
+                adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _codex_session = s
+    return _codex_session
+
+
 def check_codex_quota(access_token, account_id=None):
     """
     通过 /backend-api/wham/usage 查询 Codex 额度状态，不消耗额度。
     返回 ("ok", quota_info) | ("exhausted", exhausted_info) | ("auth_error", None)
     quota_info = {"primary_pct": int, "primary_resets_at": int, "weekly_pct": int, "weekly_resets_at": int}
     """
-    import requests
-
     if not account_id:
         account_id = get_chatgpt_account_id()
 
@@ -1847,8 +1866,9 @@ def check_codex_quota(access_token, account_id=None):
     if account_id:
         headers["Chatgpt-Account-Id"] = account_id
 
+    session = _get_codex_session()
     try:
-        resp = requests.get(
+        resp = session.get(
             "https://chatgpt.com/backend-api/wham/usage",
             headers=headers,
             timeout=30,

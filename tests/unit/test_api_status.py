@@ -1981,14 +1981,15 @@ def test_run_playwright_probe_kills_process_group_on_timeout(monkeypatch):
 def test_playwright_executor_raises_after_timeout(monkeypatch):
     executor = api._PlaywrightExecutor()
 
-    original_wait = threading.Event.wait
+    import concurrent.futures
+    original_result = concurrent.futures.Future.result
 
-    def fake_wait(self, timeout=None):
+    def fake_result(self, timeout=None):
         if timeout == 1:
-            return False
-        return original_wait(self, timeout)
+            raise concurrent.futures.TimeoutError()
+        return original_result(self, timeout)
 
-    monkeypatch.setattr(threading.Event, "wait", fake_wait)
+    monkeypatch.setattr(concurrent.futures.Future, "result", fake_result)
 
     try:
         with pytest.raises(TimeoutError):

@@ -83,13 +83,29 @@ def _migrate_legacy_state():
             pass
 
 
+_cached_state = None
+_cached_mtime = 0
+
+
 def load_admin_state():
+    global _cached_state, _cached_mtime
     _migrate_legacy_state()
-    return _load_state_from_file(STATE_FILE)
+    try:
+        mtime = STATE_FILE.stat().st_mtime
+    except Exception:
+        mtime = 0
+
+    if _cached_state is None or mtime != _cached_mtime:
+        _cached_state = _load_state_from_file(STATE_FILE)
+        _cached_mtime = mtime
+    return _cached_state
 
 
 def save_admin_state(state):
+    global _cached_state, _cached_mtime
     _save_state(state)
+    _cached_state = None
+    _cached_mtime = 0
 
 
 def update_admin_state(**kwargs):
@@ -101,6 +117,7 @@ def update_admin_state(**kwargs):
 
 
 def clear_admin_state():
+    global _cached_state, _cached_mtime
     if STATE_FILE.exists():
         # 写空内容而不是删除（保护 Docker 软链）
         target = STATE_FILE.resolve()
@@ -108,6 +125,8 @@ def clear_admin_state():
         os.chmod(target, STATE_FILE_MODE)
     if LEGACY_SESSION_FILE.exists():
         LEGACY_SESSION_FILE.unlink()
+    _cached_state = None
+    _cached_mtime = 0
 
 
 def get_admin_email():

@@ -1050,65 +1050,37 @@ def ensure_current_task_not_cancelled(task_id: str | None = None):
 # Playwright 专用线程执行器（解决跨线程调用问题）
 # ---------------------------------------------------------------------------
 
-import queue as _queue
+import concurrent.futures
 
 
 class _PlaywrightExecutor:
-    """将 Playwright 操作派发到专用线程执行，避免跨线程错误"""
+    """将 Playwright 操作派发到专用线程池中并发执行，避免跨线程错误并支持并发"""
 
     def __init__(self):
-        self._queue: _queue.Queue = _queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="PlaywrightExecutor")
         self._broken_reason: str | None = None
 
-    def _worker(self):
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            func, args, kwargs, result_event, result_holder = item
-            try:
-                result_holder["result"] = func(*args, **kwargs)
-            except Exception as e:
-                result_holder["error"] = e
-            finally:
-                result_event.set()
-
-    def ensure_started(self):
+    def run(self, func, *args, timeout_seconds=300, **kwargs):
+        """在专用线程池中执行函数，阻塞等待结果"""
         if self._broken_reason:
             raise RuntimeError(self._broken_reason)
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._worker, daemon=True)
-            self._thread.start()
-
-    def run(self, func, *args, timeout_seconds=300, **kwargs):
-        """在专用线程中执行函数，阻塞等待结果"""
-        self.ensure_started()
-        result_event = threading.Event()
-        result_holder: dict = {}
-        self._queue.put((func, args, kwargs, result_event, result_holder))
-        if not result_event.wait(timeout=max(1, timeout_seconds)):
+        
+        future = self._executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=max(1, timeout_seconds))
+        except concurrent.futures.TimeoutError as te:
             func_name = getattr(func, "__name__", repr(func))
             self._broken_reason = (
-                f"Playwright 专用线程执行超时（>{timeout_seconds}s）: {func_name}；"
-                "为避免浏览器进程继续堆积，已拒绝后续专用线程任务，请重启服务"
+                f"Playwright 线程执行超时（>{timeout_seconds}s）: {func_name}；"
+                "为避免浏览器进程继续堆积，已拒绝后续任务，请重启服务"
             )
             logger.error("[API] %s", self._broken_reason)
-            raise TimeoutError(self._broken_reason)
-        if "error" in result_holder:
-            raise result_holder["error"]
-        return result_holder.get("result")
+            raise TimeoutError(self._broken_reason) from te
 
     def stop(self):
-        if self._thread and self._thread.is_alive():
-            self._queue.put(None)
-            self._thread.join(timeout=5)
-            if self._thread.is_alive():
-                logger.warning("[API] Playwright 专用线程在停止时仍未退出")
-            else:
-                self._thread = None
-                self._queue = _queue.Queue()
-                self._broken_reason = None
+        self._executor.shutdown(wait=True)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="PlaywrightExecutor")
+        self._broken_reason = None
 
 
 _pw_executor = _PlaywrightExecutor()
@@ -3375,6 +3347,11 @@ def _stop_auto_check():
     _auto_check_stop.set()
     try:
         _pw_executor.stop()
+    except Exception:
+        pass
+    try:
+        from autoteam.browser_pool import close_all_pooled_browsers
+        close_all_pooled_browsers()
     except Exception:
         pass
 

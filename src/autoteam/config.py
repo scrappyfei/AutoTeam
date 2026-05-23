@@ -112,6 +112,8 @@ PLAYWRIGHT_PROXY_SERVER = os.environ.get("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PLAYWRIGHT_PROXY_USERNAME = os.environ.get("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.environ.get("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
 PLAYWRIGHT_PROXY_BYPASS = os.environ.get("PLAYWRIGHT_PROXY_BYPASS", "").strip()
+PLAYWRIGHT_HEADLESS = _get_bool_env("PLAYWRIGHT_HEADLESS", False)
+
 
 
 def _format_proxy_host(hostname: str) -> str:
@@ -185,8 +187,16 @@ def get_chatgpt_http_proxy_url() -> str:
 def get_playwright_launch_options():
     """统一的 Playwright Chromium 启动参数。"""
     options = {
-        "headless": False,
-        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        "headless": PLAYWRIGHT_HEADLESS,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--no-default-browser-check",
+        ],
     }
 
     proxy = None
@@ -225,5 +235,120 @@ def setup_context_optimize(context):
         context.route("**/*", block_resources)
     except Exception:
         pass
+    return context
+
+
+def create_optimized_context(browser, **extra_kwargs):
+    """创建并配置具备混淆指纹、资源拦截和自动化伪装的 Playwright BrowserContext"""
+    import random
+
+    # 真实 User-Agent 范围（选取主流 Windows / macOS Chrome 版本 128~134 之间）
+    os_versions = [
+        "Windows NT 10.0; Win64; x64",
+        "Macintosh; Intel Mac OS X 10_15_7"
+    ]
+    chrome_ver = random.randint(128, 134)
+    build_ver = random.randint(1000, 9999)
+    patch_ver = random.randint(100, 199)
+    os_spec = random.choice(os_versions)
+    ua = f"Mozilla/5.0 ({os_spec}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.{build_ver}.{patch_ver} Safari/537.36"
+
+    # 随机屏幕视口大小
+    viewports = [
+        {"width": 1366, "height": 768},
+        {"width": 1440, "height": 900},
+        {"width": 1536, "height": 864},
+        {"width": 1920, "height": 1080}
+    ]
+    viewport = random.choice(viewports)
+    device_scale_factor = random.choice([1, 1.25, 1.5, 2])
+
+    # 随机常用语言和时区
+    locales_timezones = [
+        ("en-US", "America/New_York"),
+        ("en-GB", "Europe/London"),
+        ("zh-CN", "Asia/Shanghai"),
+    ]
+    locale, timezone_id = random.choice(locales_timezones)
+
+    context_args = {
+        "user_agent": ua,
+        "viewport": viewport,
+        "device_scale_factor": device_scale_factor,
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "accept_downloads": True,
+    }
+    # 允许显式传递的额外参数覆盖默认指纹
+    context_args.update(extra_kwargs)
+
+    context = browser.new_context(**context_args)
+    
+    # 资源优化拦截（图片、视频、字体过滤）
+    setup_context_optimize(context)
+
+    # 注入无痕伪装 Stealth JS 脚本
+    stealth_script = """
+    // 隐藏 automation 属性 webdriver
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // 伪装 chrome 全局对象
+    window.chrome = {
+      app: {
+        isInstalled: false,
+        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+      },
+      runtime: {
+        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+        OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+        PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+        RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+      }
+    };
+
+    // 伪装真实浏览器插件列表
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => {
+        return [
+          { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbgojcjbhgocjbpjepghjelbphcgd', description: 'Portable Document Format' },
+          { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+        ];
+      }
+    });
+
+    // 伪装 Notification 权限查询
+    if (window.navigator.permissions) {
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    }
+
+    // 伪装 WebGL 渲染硬件信息
+    const mockWebGL = (glContext) => {
+      const getParameter = glContext.prototype.getParameter;
+      glContext.prototype.getParameter = function(parameter) {
+        // UNMASKED_VENDOR_WEBGL
+        if (parameter === 37445) {
+          return 'Intel Open Source Technology Center';
+        }
+        // UNMASKED_RENDERER_WEBGL
+        if (parameter === 37446) {
+          return 'Mesa DRI Intel(R) UHD Graphics (CML GT2)';
+        }
+        return getParameter.call(this, parameter);
+      };
+    };
+    if (window.WebGLRenderingContext) mockWebGL(WebGLRenderingContext);
+    if (window.WebGL2RenderingContext) mockWebGL(WebGL2RenderingContext);
+    """
+    
+    context.add_init_script(stealth_script)
     return context
 

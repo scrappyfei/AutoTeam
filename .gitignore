@@ -7,6 +7,10 @@ screenshots/
 auth_state/
 auths/
 accounts.json
+accounts.db
+accounts.db-journal
+accounts.db-wal
+accounts.db-shm
 state.json
 session
 bearer_token
