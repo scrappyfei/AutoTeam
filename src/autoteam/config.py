@@ -188,15 +188,7 @@ def get_playwright_launch_options():
     """统一的 Playwright Chromium 启动参数。"""
     options = {
         "headless": PLAYWRIGHT_HEADLESS,
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--disable-extensions",
-            "--disable-default-apps",
-            "--no-default-browser-check",
-        ],
+        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
     }
 
     proxy = None
@@ -218,148 +210,18 @@ def get_playwright_launch_options():
 
 
 def setup_context_optimize(context):
-    """设置 Playwright Context 资源请求过滤，拦截图片、视频和字体文件以节省流量和 CPU 开销。"""
-    def block_resources(route):
-        try:
-            if route.request.resource_type in ("image", "media", "font"):
-                route.abort()
-            else:
-                route.continue_()
-        except Exception:
-            try:
-                route.continue_()
-            except Exception:
-                pass
-
-    try:
-        context.route("**/*", block_resources)
-    except Exception:
-        pass
+    """设置 Playwright Context 资源请求过滤 (已回退禁用，避免影响验证)"""
     return context
 
 
 def create_optimized_context(browser, **extra_kwargs):
-    """
-    智能配置 Playwright BrowserContext。
-    在 headful 模式下：保留浏览器原生的完美指纹（真实 UA、设备分辨率、物理显卡、时区等），避免人工伪装带来特征冲突。
-    在 headless 模式下：对 Headless 特征（如 HeadlessChrome User-Agent、SwiftShader 虚拟显卡、navigator.webdriver）进行高保真无痕伪装。
-    """
-    import os
-
-    is_headless = os.environ.get("PLAYWRIGHT_HEADLESS", "False").lower() in ("true", "1")
-
+    """创建并配置 Playwright BrowserContext (已还原指纹及优化限制)"""
     context_args = {
-        "accept_downloads": True,
+        "viewport": {"width": 1280, "height": 800},
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     }
-
-    if is_headless:
-        # 1. 抽取真实浏览器版本，对齐 UA 版本，防止 navigator.userAgentData 版本冲突
-        browser_ver = browser.version or "148.0.0.0"
-        # 统一使用 Windows NT 10.0 作为 Headless 的高保真伪装系统（契合大多数部署环境）
-        ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browser_ver} Safari/537.36"
-        context_args["user_agent"] = ua
-
-        # 2. 随机设置常见分辨率，防止固定的 1280x800 特征被标记
-        import random
-        viewports = [
-            {"width": 1366, "height": 768},
-            {"width": 1440, "height": 900},
-            {"width": 1536, "height": 864},
-            {"width": 1920, "height": 1080}
-        ]
-        context_args["viewport"] = random.choice(viewports)
-        context_args["device_scale_factor"] = random.choice([1, 1.25, 1.5, 2])
-        
-        # 3. 设置默认 Locale 和时区
-        context_args["locale"] = "zh-CN"
-        context_args["timezone_id"] = "Asia/Shanghai"
-
-    # 允许显式传递的参数覆盖默认指纹
     context_args.update(extra_kwargs)
-
     context = browser.new_context(**context_args)
-
-    # 4. 路由资源拦截优化（默认关闭，仅在显式开启 optimize_routes 时生效）
-    # 注：注册、邀请等流程包含大量 Cloudflare Turnstile 验证，强行 abort 资源容易引起 CF 风控检测，因此默认不开启路由拦截优化。
-    if extra_kwargs.get("optimize_routes"):
-        setup_context_optimize(context)
-
-    # 5. 注入高保真反检测 Stealth 脚本（内含 WebGL 智能降级/伪装）
-    stealth_script = """
-    // 隐藏 automation 属性 webdriver
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-    // 伪装 chrome 全局对象
-    window.chrome = {
-      app: {
-        isInstalled: false,
-        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
-      },
-      runtime: {
-        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-        OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-        PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-        PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-        PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-        RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
-      }
-    };
-
-    // 伪装真实浏览器插件列表
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => {
-        return [
-          { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbgojcjbhgocjbpjepghjelbphcgd', description: 'Portable Document Format' },
-          { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
-        ];
-      }
-    });
-
-    // 伪装 Notification 权限查询
-    if (window.navigator.permissions) {
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-    }
-
-    // 智能伪装 WebGL 渲染硬件信息（仅当检测到虚拟/软件渲染器时，才覆盖为物理显卡）
-    (() => {
-      const canvas = document.createElement('canvas');
-      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-      if (!gl) return;
-      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-      if (!debugInfo) return;
-      const nativeRenderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || '';
-      const nativeVendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) || '';
-      
-      const isVirtual = /swiftshader|llvmpipe|virtual|mesa|google|software/i.test(nativeRenderer) || 
-                        /google/i.test(nativeVendor);
-      
-      if (isVirtual) {
-        const mockWebGL = (glContext) => {
-          const getParameter = glContext.prototype.getParameter;
-          glContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
-              return 'Google Inc. (Intel)';
-            }
-            if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
-               return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            }
-            return getParameter.call(this, parameter);
-          };
-        };
-        if (window.WebGLRenderingContext) mockWebGL(WebGLRenderingContext);
-        if (window.WebGL2RenderingContext) mockWebGL(WebGL2RenderingContext);
-      }
-    })();
-    StealthScriptMarker = true;
-    """
-    
-    context.add_init_script(stealth_script)
     return context
+
 

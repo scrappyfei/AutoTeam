@@ -149,11 +149,7 @@ def test_create_optimized_context():
         page = context.new_page()
         ua = page.evaluate("navigator.userAgent")
         assert "Chrome" in ua
-        assert "146.0.0.0" not in ua  # 校验老旧硬编码 UA 已被移除
-        
-        # 校验 stealth 注入脚本成功抹去了 webdriver 自动化特征
-        webdriver = page.evaluate("navigator.webdriver")
-        assert webdriver is None
+        assert "146.0.0.0" in ua  # 校验老旧硬编码 UA 已还原
     finally:
         context.close()
         close_thread_browser()
