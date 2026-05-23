@@ -27,6 +27,7 @@ import threading
 import time
 from pathlib import Path
 
+from autoteam import set_thread_log_prefix, update_thread_log_prefix
 from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.accounts import (
     STATUS_ACTIVE,
@@ -2260,6 +2261,7 @@ def create_account_direct(mail_client, chatgpt_api=None):
     from autoteam.account_ops import delete_managed_account
 
     account_id, email = mail_client.create_temp_email()
+    update_thread_log_prefix(email.split('@')[0])
     password = f"Tmp_{uuid.uuid4().hex[:12]}!"
     signup_profile = generate_signup_profile()
 
@@ -2944,21 +2946,6 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
-# 用于并发注册时区分不同 Worker 日志的线程本地变量与过滤器
-_worker_log_local = threading.local()
-
-class WorkerLogFilter(logging.Filter):
-    def filter(self, record):
-        prefix = getattr(_worker_log_local, "worker_prefix", "")
-        if prefix:
-            if isinstance(record.msg, str) and not record.msg.startswith("[Worker"):
-                record.msg = f"{prefix} {record.msg}"
-        return True
-
-# 确保过滤器已注册到 root logger
-root_logger = logging.getLogger()
-if not any(isinstance(f, WorkerLogFilter) for f in root_logger.filters):
-    root_logger.addFilter(WorkerLogFilter())
 
 
 def cmd_add(count: int = 1, concurrency: int = 1):
@@ -3024,9 +3011,10 @@ def cmd_add(count: int = 1, concurrency: int = 1):
 
     def worker(worker_idx):
         nonlocal success_count, in_progress_count
-        _worker_log_local.worker_prefix = f"[Worker-{worker_idx}]"
+        set_thread_log_prefix(f"[Worker-{worker_idx}]")
 
         while True:
+            set_thread_log_prefix(f"[Worker-{worker_idx}]")
             _abort_if_cancel_requested()
             with success_lock:
                 if success_count >= count:

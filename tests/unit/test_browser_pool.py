@@ -157,3 +157,38 @@ def test_create_optimized_context():
     finally:
         context.close()
         close_thread_browser()
+
+
+def test_thread_local_logging_prefix(caplog):
+    import logging
+    from autoteam import set_thread_log_prefix, update_thread_log_prefix, get_thread_log_prefix
+    
+    test_logger = logging.getLogger("autoteam.test_logging_prefix")
+    
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        # 1. Test base prefix
+        set_thread_log_prefix("[Worker-1]")
+        assert get_thread_log_prefix() == "[Worker-1]"
+        test_logger.info("hello world")
+        assert len(caplog.records) == 1
+        assert caplog.records[0].message == "[Worker-1] hello world"
+        
+        # 2. Test update prefix
+        update_thread_log_prefix("myemail")
+        assert get_thread_log_prefix() == "[Worker-1:myemail]"
+        test_logger.info("status ok")
+        assert len(caplog.records) == 2
+        assert caplog.records[1].message == "[Worker-1:myemail] status ok"
+        
+        # 3. Message that already contains prefix should not be duplicated
+        test_logger.info("[Worker-1:myemail] status ok")
+        assert len(caplog.records) == 3
+        assert caplog.records[2].message == "[Worker-1:myemail] status ok"
+
+        # 4. Reset prefix
+        set_thread_log_prefix("")
+        test_logger.info("done")
+        assert len(caplog.records) == 4
+        assert caplog.records[3].message == "done"
+
